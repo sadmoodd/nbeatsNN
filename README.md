@@ -246,19 +246,6 @@ python predict_nbeats.py
 
 ## 🐛 Решение проблем
 
-### Ошибка: "Size of tensor a (30) must match size of tensor b (32)"
-
-**Решение:**
-```bash
-# Используйте исправленные версии файлов
-cp nbeats_model_FIXED.py nbeats_model.py
-cp train_nbeats_FIXED.py train_nbeats.py
-
-# Затем запустите обучение
-python train_nbeats.py
-```
-
-Подробнее: см. `ERROR_ANALYSIS.txt` и `FIX_GUIDE.txt`
 
 ### Ошибка: "CUDA out of memory"
 
@@ -349,7 +336,7 @@ python -c "import torch; print('GPU:', torch.cuda.is_available())"
 4. Имплементируйте стратегию ансамбля (ensemble) нескольких моделей
 
 ### Для production:
-1. Используйте исправленные версии: `nbeats_model_FIXED.py` и `train_nbeats_FIXED.py`
+1. Используйте версии: `nbeats_model.py` и `train_nbeats.py`
 2. Настройте мониторинг качества прогнозов
 3. Регулярно переобучайте модель на свежих данных
 4. Создайте API для интеграции с другими системами
@@ -360,6 +347,19 @@ python -c "import torch; print('GPU:', torch.cuda.is_available())"
 # Полная установка и запуск
 git clone <repository>
 cd fish-sales-forecasting
+python -m venv .venv
+```
+Для Windows используйте 
+```cmd
+.venv\Scrips\activate
+```
+
+Для Linux используйте
+```bash
+source .venv/bin/activate
+```
+
+```bash
 pip install -r requirements.txt
 mkdir -p data
 # Поместите DATA.csv в папку data/
