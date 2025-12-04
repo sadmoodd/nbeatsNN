@@ -1,3 +1,6 @@
+"""
+utils_fixed.py - Исправленная версия с правильной N-BEATS архитектурой
+"""
 import pandas as pd
 import numpy as np
 import torch
@@ -6,10 +9,17 @@ import torch.optim as optim
 from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler
 import re
+import os
+import pickle
 
-# ------------------------
-# Транслитерация и очистка
-# ------------------------
+pd.set_option('future.no_silent_downcasting', True)
+
+# ========================
+# ТРАНСЛИТЕРАЦИЯ
+# ========================
+
+
+
 RUSLAT = {
     u'а': 'a', u'б': 'b', u'в': 'v', u'г': 'g', u'д': 'd', u'е': 'e', u'ё': 'e',
     u'ж': 'zh', u'з': 'z', u'и': 'i', u'й': 'j', u'к': 'k', u'л': 'l', u'м': 'm',
@@ -17,6 +27,7 @@ RUSLAT = {
     u'ф': 'f', u'х': 'h', u'ц': 'c', u'ч': 'ch', u'ш': 'sh', u'щ': 'shh',
     u'ъ': '', u'ы': 'y', u'ь': '', u'э': 'e', u'ю': 'yu', u'я': 'ya'
 }
+
 def translit_ru(txt):
     res = ''
     for c in txt:
@@ -34,532 +45,408 @@ def safe_filename(name: str) -> str:
     name = name.strip('_')
     return name
 
+# ========================
+# ДАТАСЕТ - ИСПРАВЛЕННЫЙ
+# ========================
+
+class TimeSeriesDataset(Dataset):
+    """
+    Правильный датасет для временных рядов.
+    Работает ТОЛЬКО с целевой переменной (Количество).
+    Признаки (погода, календарь) используются как дополнительный контекст.
+    """
     
-class FishSalesDataset(Dataset):
-    def __init__(self, dataframe, sequence_length=30, target_column='Количество'):
+    def __init__(self, dataframe, sequence_length=30, target_column='Количество', use_features=True):
         self.sequence_length = sequence_length
         self.target_column = target_column
+        self.use_features = use_features
         self.df = dataframe.copy()
         self.df = self.df.sort_values('date').reset_index(drop=True)
-
         self.df['date'] = pd.to_datetime(self.df['date'])
-        self.df['year'] = self.df['date'].dt.year
-        self.df['month'] = self.df['date'].dt.month
-        self.df['day'] = self.df['date'].dt.day
-        self.df['day_of_week'] = self.df['date'].dt.dayofweek
-        self.df['is_weekend'] = (self.df['day_of_week'] >= 5).astype(int)
-
-        numeric_columns = [
-            'Максимальная температура', 'Минимальная температура', 'Средняя температура',
-            'Атмосферное давление, гПа', 'Скорость ветра, м/с', 'Осадки, мм',
-            'Эффективная температура', 'year', 'month', 'day', 'day_of_week',
-            'is_weekend', 'is_working', 'is_holiday', 'is_pre_holiday',
-            'is_new_year', 'is_spring_holiday', 'is_may_holiday', 'season',
-            'is_monday', 'is_friday', 'is_month_end', 'is_quarter_end', 'salary_week'
-        ]
-        self.features_columns = [col for col in numeric_columns if col in self.df.columns]
-
-        self.df[self.features_columns + [self.target_column]] = self.df[self.features_columns + [self.target_column]].fillna(0)
-
-        self.scaler = StandardScaler()
-        scaled = self.scaler.fit_transform(self.df[self.features_columns + [self.target_column]])
-
-        self.scaled_features = scaled[:, :-1]
-        self.scaled_target = scaled[:, -1]
-
-    def __len__(self):
-        return len(self.scaled_features) - self.sequence_length
-
-    def __getitem__(self, idx):
-        x = self.scaled_features[idx:idx + self.sequence_length]
-        y = self.scaled_target[idx + self.sequence_length]
-        return torch.FloatTensor(x), torch.FloatTensor([y])
-
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.3):
-        super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
-        self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_size, 1)
-
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = self.dropout(out[:, -1, :])
-        out = self.fc(out)
-        return out
-
-def train_model(model, train_loader, val_loader, epochs=100, lr=0.001):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
-    best_loss = float('inf')
-    patience = 10
-    patience_counter = 0
-
-    for epoch in range(epochs):
-        model.train()
-        train_losses = []
-        for x_batch, y_batch in train_loader:
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-            optimizer.zero_grad()
-            out = model(x_batch)
-            loss = criterion(out, y_batch)
-            loss.backward()
-            optimizer.step()
-            train_losses.append(loss.item())
-        train_loss = np.mean(train_losses)
-
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for x_val, y_val in val_loader:
-                x_val, y_val = x_val.to(device), y_val.to(device)
-                out_val = model(x_val)
-                loss_val = criterion(out_val, y_val)
-                val_losses.append(loss_val.item())
-        val_loss = np.mean(val_losses)
-        scheduler.step(val_loss)
-
-        print(f'Epoch {epoch+1}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
-
-        if val_loss < best_loss:
-            best_loss = val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), 'best_model.pth')
+        
+        # Целевая переменная
+        self.target_values = self.df[target_column].values.astype(np.float32)
+        
+        # Признаки (если используются)
+        if use_features:
+            feature_cols = [
+                'Максимальная температура', 'Минимальная температура', 'Средняя температура',
+                'Атмосферное давление, гПа', 'Скорость ветра, м/с', 'Осадки, мм',
+                'Эффективная температура', 'year', 'month', 'day', 'day_of_week',
+                'is_weekend', 'is_working', 'is_holiday', 'is_pre_holiday',
+                'is_new_year', 'is_spring_holiday', 'is_may_holiday', 'season',
+                'is_monday', 'is_friday', 'is_month_end', 'is_quarter_end', 'salary_week'
+            ]
+            self.feature_columns = [col for col in feature_cols if col in self.df.columns]
+            
+            # Масштабируем ТОЛЬКО признаки (целевая переменная масштабируется отдельно)
+            feature_data = self.df[self.feature_columns].fillna(0).values
+            self.feature_scaler = StandardScaler()
+            self.scaled_features = self.feature_scaler.fit_transform(feature_data).astype(np.float32)
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f'Early stopping on epoch {epoch+1}')
-                break
-
-    model.load_state_dict(torch.load('best_model.pth'))
-    return model
-
-def predict_future(model, dataset, days=30):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.eval()
-    data = dataset.scaled_features
-    seq_len = dataset.sequence_length
-    scaler = dataset.scaler
-
-    sequence = data[-seq_len:].copy()
-    predictions = []
-
-    for _ in range(days):
-        seq_tensor = torch.FloatTensor(sequence).unsqueeze(0).to(device)
-        with torch.no_grad():
-            pred_scaled = model(seq_tensor).cpu().numpy()[0, 0]
-
-        dummy = np.zeros((1, len(dataset.features_columns) + 1))
-        dummy[0, -1] = pred_scaled
-        pred_original = scaler.inverse_transform(dummy)[0, -1]
-        pred_original = max(0, pred_original)
-
-        predictions.append(pred_original)
-
-        next_features = sequence[-1].copy()
-        next_features[-1] = pred_scaled
-        sequence = np.vstack([sequence[1:], next_features])
-
-    return predictions
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-from torch.utils.data import DataLoader
-import os
+            self.feature_columns = []
+            self.feature_scaler = None
+            self.scaled_features = None
+        
+        # Масштабируем целевую переменную (ОТДЕЛЬНО!)
+        self.target_scaler = StandardScaler()
+        self.scaled_target = self.target_scaler.fit_transform(
+            self.target_values.reshape(-1, 1)
+        ).flatten().astype(np.float32)
+    
+    def __len__(self):
+        return len(self.scaled_target) - self.sequence_length
+    
+    def __getitem__(self, idx):
+        # История целевой переменной (последовательность)
+        target_seq = self.scaled_target[idx:idx + self.sequence_length]  # shape: (seq_len,)
+        
+        # Цель (следующее значение целевой переменной)
+        target_next = self.scaled_target[idx + self.sequence_length]  # scalar
+        
+        if self.use_features and self.scaled_features is not None:
+            # Признаки для этого временного окна
+            feature_seq = self.scaled_features[idx:idx + self.sequence_length]  # (seq_len, num_features)
+            
+            # ✅ КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: объединяем и ФЛАТТЕНИМ!
+            x_combined = np.concatenate([
+                target_seq.reshape(-1, 1),      # (30, 1)
+                feature_seq                     # (30, 24)
+            ], axis=1)                          # (30, 25)
+            
+            x_flat = x_combined.flatten()       # (750,) ← ОТВЕТ!
+            
+        else:
+            x_flat = target_seq                 # (30,)
+        
+        return torch.FloatTensor(x_flat), torch.FloatTensor([target_next])
 
 
-# ================================
-# 1. N-BEATS BLOCK (исправленный)
-# ================================
+# ========================
+# N-BEATS АРХИТЕКТУРА (ИСПРАВЛЕННАЯ)
+# ========================
 
 class NBeatsBlock(nn.Module):
     """
-    Базовый блок N-BEATS с residual connections.
-
-    ИСПРАВЛЕНИЕ: теперь правильно работает с флаттенированными входами
-
-    Входные данные должны быть формы: (batch_size, flattened_input_size)
-    где flattened_input_size = sequence_length * num_features
+    N-BEATS блок с правильными residual connections.
+    
+    Входные данные: (batch_size, seq_len, input_dim)
+    где input_dim = 1 (целевая) + num_features
     """
-
+    
     def __init__(self, 
-                 input_size, 
-                 output_size, 
-                 hidden_layers=None,
-                 dropout=0.1,
-                 activation='relu'):
+                 input_size,  # seq_len * input_dim (flattened)
+                 output_size,  # forecast horizon
+                 hidden_sizes=None,
+                 dropout=0.1):
         super(NBeatsBlock, self).__init__()
-
-        if hidden_layers is None:
-            hidden_layers = [512, 512]
-
+        
+        if hidden_sizes is None:
+            hidden_sizes = [512, 512, 512]
+        
         self.input_size = input_size
         self.output_size = output_size
-        self.hidden_layers = hidden_layers
-        self.dropout_rate = dropout
-
-        # Активационная функция
-        if activation == 'relu':
-            self.activation = nn.ReLU()
-        elif activation == 'elu':
-            self.activation = nn.ELU()
-        elif activation == 'tanh':
-            self.activation = nn.Tanh()
-        else:
-            self.activation = nn.ReLU()
-
-        # ==========================================
-        # ОСНОВНОЙ МОДУЛЬ: Стек полносвязных слоев
-        # ==========================================
-
+        
+        # Стек полносвязных слоев
         layers = []
         prev_size = input_size
-
-        for hidden_size in hidden_layers:
+        
+        for hidden_size in hidden_sizes:
             layers.append(nn.Linear(prev_size, hidden_size))
-            layers.append(self.activation)
+            layers.append(nn.ReLU())
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
             prev_size = hidden_size
-
-        self.fc_layers = nn.Sequential(*layers)
-
-        # ==========================================
-        # ВЫХОДНЫЕ СЛОИ
-        # ==========================================
-
-        # 1. Backcast head - восстанавливает входную последовательность
-        self.backcast_fc = nn.Linear(hidden_layers[-1], input_size)
-
-        # 2. Forecast head - генерирует прогноз
-        self.forecast_fc = nn.Linear(hidden_layers[-1], output_size)
-
+        
+        self.fc_stack = nn.Sequential(*layers)
+        
+        # Backcast head: восстанавливает входную последовательность
+        self.backcast_head = nn.Linear(hidden_sizes[-1], input_size)
+        
+        # Forecast head: генерирует прогноз
+        self.forecast_head = nn.Linear(hidden_sizes[-1], output_size)
+    
     def forward(self, x):
         """
-        Входные параметры:
-        - x: (batch_size, flattened_input_size) - флаттенированная входная последовательность
-
-        Выходные параметры:
-        - backcast: (batch_size, flattened_input_size) - восстановленный вход
-        - forecast: (batch_size, output_size) - прогноз
+        x: (batch_size, input_size) - флаттенированная последовательность
+        Returns:
+            backcast: (batch_size, input_size)
+            forecast: (batch_size, output_size)
         """
-
-        # Проверяем размеры (для debug)
-        if x.shape[-1] != self.input_size:
-            raise ValueError(
-                f"Ошибка размера: ожидается input_size={self.input_size}, "
-                f"получено {x.shape[-1]}. "
-                f"Полная форма батча: {x.shape}"
-            )
-
-        # Пропускаем через стек полносвязных слоев
-        hidden = self.fc_layers(x)
-
-        # Генерируем backcast и forecast
-        backcast = self.backcast_fc(hidden)
-        forecast = self.forecast_fc(hidden)
-
+        hidden = self.fc_stack(x)
+        backcast = self.backcast_head(hidden)
+        forecast = self.forecast_head(hidden)
         return backcast, forecast
-
-
-# ================================
-# 2. N-BEATS STACK (исправленный)
-# ================================
 
 class NBeatsStack(nn.Module):
     """
-    Стек блоков N-BEATS.
+    Стек N-BEATS блоков с residual connections.
     """
-
-    def __init__(self, 
+    
+    def __init__(self,
                  num_blocks,
                  input_size,
                  output_size,
-                 hidden_layers=None,
+                 hidden_sizes=None,
                  dropout=0.1):
         super(NBeatsStack, self).__init__()
-
-        if hidden_layers is None:
-            hidden_layers = [512, 512]
-
-        self.num_blocks = num_blocks
-        self.input_size = input_size
-        self.output_size = output_size
-
-        # Создаем несколько блоков в стеке
+        
+        if hidden_sizes is None:
+            hidden_sizes = [512, 512, 512]
+        
         self.blocks = nn.ModuleList([
-            NBeatsBlock(
-                input_size=input_size,
-                output_size=output_size,
-                hidden_layers=hidden_layers,
-                dropout=dropout
-            )
+            NBeatsBlock(input_size, output_size, hidden_sizes, dropout)
             for _ in range(num_blocks)
         ])
-
+    
     def forward(self, x):
         """
-        Входные параметры:
-        - x: (batch_size, input_size) - входная последовательность
-
-        Выходные параметры:
-        - forecast_sum: (batch_size, output_size) - суммированные прогнозы
-        - residual: (batch_size, input_size) - остаток после всех блоков
+        x: (batch_size, input_size)
+        Returns:
+            forecast_sum: (batch_size, output_size) - суммированные прогнозы всех блоков
+            residual: (batch_size, input_size) - остаток после всех блоков
         """
-
-        # Инициализируем остаток первоначально равным входу
-        residual = x
+        residual = x.clone()
         forecast_sum = None
-
-        for i, block in enumerate(self.blocks):
-            try:
-                # Пропускаем остаток через блок
-                backcast, forecast = block(residual)
-
-                # Обновляем остаток: вычитаем backcast из текущего остатка
-                residual = residual - backcast
-
-                # Суммируем прогнозы
-                if forecast_sum is None:
-                    forecast_sum = forecast
-                else:
-                    forecast_sum = forecast_sum + forecast
-            except Exception as e:
-                print(f"Ошибка в блоке {i} стека:")
-                print(f"  Форма residual: {residual.shape}")
-                print(f"  Форма backcast: {backcast.shape}")
-                print(f"  Форма forecast: {forecast.shape}")
-                raise e
-
+        
+        for block in self.blocks:
+            backcast, forecast = block(residual)
+            residual = residual - backcast  # Residual connection
+            
+            if forecast_sum is None:
+                forecast_sum = forecast
+            else:
+                forecast_sum = forecast_sum + forecast
+        
         return forecast_sum, residual
-
-
-# ================================
-# 3. ПОЛНАЯ N-BEATS АРХИТЕКТУРА
-# ================================
 
 class NBeatsModel(nn.Module):
     """
-    Полная архитектура N-BEATS с несколькими стеками.
+    Полная N-BEATS архитектура с несколькими стеками.
     """
-
-    def __init__(self, 
+    
+    def __init__(self,
                  input_size,
                  output_size,
                  num_stacks=3,
-                 num_blocks=3,
-                 hidden_layers=None,
+                 num_blocks_per_stack=3,
+                 hidden_sizes=None,
                  dropout=0.1):
         super(NBeatsModel, self).__init__()
-
-        if hidden_layers is None:
-            hidden_layers = [512, 512]
-
-        self.input_size = input_size
-        self.output_size = output_size
-        self.num_stacks = num_stacks
-
-        # Создаем несколько стеков
+        
+        if hidden_sizes is None:
+            hidden_sizes = [512, 512, 512]
+        
         self.stacks = nn.ModuleList([
-            NBeatsStack(
-                num_blocks=num_blocks,
-                input_size=input_size,
-                output_size=output_size,
-                hidden_layers=hidden_layers,
-                dropout=dropout
-            )
+            NBeatsStack(num_blocks_per_stack, input_size, output_size, hidden_sizes, dropout)
             for _ in range(num_stacks)
         ])
-
+    
     def forward(self, x):
         """
-        Входные параметры:
-        - x: (batch_size, input_size) - входная последовательность
-
-        Выходные параметры:
-        - forecast: (batch_size, output_size) - итоговый прогноз
+        x: (batch_size, input_size)
+        Returns:
+            forecast: (batch_size, output_size)
         """
-
         forecasts = []
-
         for stack in self.stacks:
             forecast, _ = stack(x)
             forecasts.append(forecast)
-
+        
         # Суммируем прогнозы всех стеков
-        final_forecast = sum(forecasts)
-
+        final_forecast = torch.stack(forecasts, dim=0).sum(dim=0)
         return final_forecast
 
+# ========================
+# ОБУЧЕНИЕ
+# ========================
 
-# ================================
-# 4. ФУНКЦИИ ОБУЧЕНИЯ
-# ================================
-
-def train_nbeats_model(model, train_loader, val_loader, 
-                       epochs=100, lr=0.001, device='cpu',
-                       early_stopping_patience=10):
+def train_nbeats(model, train_loader, val_loader,
+                 epochs=150, lr=0.001, device='cpu',
+                 early_stopping_patience=15, verbose=True):
     """
-    Функция обучения N-BEATS модели с обработкой ошибок.
+    Обучение N-BEATS модели.
     """
-
     model.to(device)
-
-    # Оптимизатор
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    # Loss функция
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     criterion = nn.MSELoss()
-
-    # Learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='min', 
-        factor=0.5, 
-        patience=5
+        optimizer, mode='min', factor=0.5, patience=5
     )
-
+    
     best_val_loss = float('inf')
     patience_counter = 0
-    training_history = {'train_loss': [], 'val_loss': []}
-
+    history = {'train_loss': [], 'val_loss': []}
+    
     for epoch in range(epochs):
-        # ==================
-        # ОБУЧЕНИЕ
-        # ==================
+        # ===== ОБУЧЕНИЕ =====
         model.train()
         train_losses = []
-
-        try:
-            for batch_idx, (x_batch, y_batch) in enumerate(train_loader):
-                x_batch = x_batch.to(device)
-                y_batch = y_batch.to(device)
-
-                # Проверяем размеры
-                if x_batch.dim() != 2:
-                    raise ValueError(
-                        f"Ожидается 2D батч (batch_size, input_size), "
-                        f"получено {x_batch.dim()}D с формой {x_batch.shape}"
-                    )
-
-                # Прямой проход
-                optimizer.zero_grad()
-                predictions = model(x_batch)
-
-                # Вычисляем loss
-                loss = criterion(predictions, y_batch)
-
-                # Обратный проход
-                loss.backward()
-                optimizer.step()
-
-                train_losses.append(loss.item())
-
-        except Exception as e:
-            print(f"\n❌ Ошибка в батче {batch_idx} эпохи {epoch+1}:")
-            print(f"   Форма x_batch: {x_batch.shape}")
-            print(f"   Форма y_batch: {y_batch.shape}")
-            print(f"   Сообщение ошибки: {str(e)}")
-            raise e
-
+        
+        for x_batch, y_batch in train_loader:
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+            
+            optimizer.zero_grad()
+            predictions = model(x_batch)
+            loss = criterion(predictions, y_batch)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            train_losses.append(loss.item())
+        
         train_loss = np.mean(train_losses)
-
-        # ==================
-        # ВАЛИДАЦИЯ
-        # ==================
+        
+        # ===== ВАЛИДАЦИЯ =====
         model.eval()
         val_losses = []
-
+        
         with torch.no_grad():
             for x_val, y_val in val_loader:
                 x_val = x_val.to(device)
                 y_val = y_val.to(device)
-
+                
                 predictions = model(x_val)
                 loss = criterion(predictions, y_val)
                 val_losses.append(loss.item())
-
+        
         val_loss = np.mean(val_losses)
-
-        # Сохраняем историю
-        training_history['train_loss'].append(train_loss)
-        training_history['val_loss'].append(val_loss)
-
-        # Learning rate scheduler step
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        
         scheduler.step(val_loss)
-
-        # Вывод прогресса
-        if (epoch + 1) % 10 == 0:
-            print(f'Epoch {epoch+1}/{epochs} | '
-                  f'Train Loss: {train_loss:.6f} | '
-                  f'Val Loss: {val_loss:.6f}')
-
-        # ==================
-        # EARLY STOPPING
-        # ==================
+        
+        if verbose and (epoch + 1) % 20 == 0:
+            print(f'  Epoch {epoch+1:3d}/{epochs} | Train: {train_loss:.6f} | Val: {val_loss:.6f}')
+        
+        # ===== EARLY STOPPING =====
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            # Сохраняем лучшую модель
-            torch.save(model.state_dict(), 'best_nbeats_model.pth')
+            torch.save(model.state_dict(), '_best_model.pth')
         else:
             patience_counter += 1
             if patience_counter >= early_stopping_patience:
-                print(f'Early stopping at epoch {epoch+1}')
+                if verbose:
+                    print(f'  Early stopping at epoch {epoch+1}')
                 break
-
+    
     # Загружаем лучшую модель
-    if os.path.exists('best_nbeats_model.pth'):
-        model.load_state_dict(torch.load('best_nbeats_model.pth'))
+    if os.path.exists('_best_model.pth'):
+        model.load_state_dict(torch.load('_best_model.pth'))
+        os.remove('_best_model.pth')
+    
+    return model, history
 
-    return model, training_history
-
+# ========================
+# ПРОГНОЗИРОВАНИЕ
+# ========================
 
 def predict_nbeats(model, dataset, num_steps=30, device='cpu'):
     """
-    Функция для прогнозирования будущих значений N-BEATS моделью.
-
-    ИСПРАВЛЕНО: работает с флаттенированными данными
+    Прогнозирование на num_steps шагов вперёд.
+    
+    Возвращает прогнозы в ОРИГИНАЛЬНОЙ шкале (денормализованные).
     """
-
     model.eval()
-
-    # Получаем последовательность из данных
-    sequence = dataset.scaled_features[-dataset.sequence_length:].copy()
-    scaler = dataset.scaler
-
-    predictions = []
-
+    
+    # Получаем последнюю последовательность
+    seq_len = dataset.sequence_length
+    last_target = dataset.scaled_target[-seq_len:].copy()  # (seq_len,)
+    
+    if dataset.use_features:
+        last_features = dataset.scaled_features[-seq_len:].copy()  # (seq_len, num_features)
+        # Объединяем: целевая + признаки
+        current_seq = np.concatenate([
+            last_target.reshape(-1, 1),
+            last_features
+        ], axis=1)  # (seq_len, 1 + num_features)
+    else:
+        current_seq = last_target.reshape(-1, 1)  # (seq_len, 1)
+    
+    predictions_scaled = []
+    
     with torch.no_grad():
-        for _ in range(num_steps):
-            # Флаттенируем последовательность
-            # sequence.shape = (sequence_length, num_features)
-            sequence_flat = sequence.flatten()  # Shape: (sequence_length * num_features,)
-            sequence_tensor = torch.FloatTensor(sequence_flat).unsqueeze(0).to(device)
+        for step in range(num_steps):
+            # Флаттенируем для модели
+            seq_flat = current_seq.flatten()  # (seq_len * (1 + num_features),)
+            seq_tensor = torch.FloatTensor(seq_flat).unsqueeze(0).to(device)
+            
+            # Предсказываем
+            pred_scaled = model(seq_tensor).cpu().numpy()[0, 0]
+            predictions_scaled.append(pred_scaled)
+            
+            # Обновляем последовательность: сдвигаемся на шаг
+            if dataset.use_features:
+                # Используем последний вектор признаков (они меняются редко)
+                next_features = current_seq[-1, 1:].copy()
+                new_row = np.concatenate([[pred_scaled], next_features])
+            else:
+                new_row = np.array([pred_scaled])
+            
+            current_seq = np.vstack([current_seq[1:], new_row])
+    
+    # ===== ДЕНОРМАЛИЗАЦИЯ =====
+    predictions_original = []
+    for pred_scaled in predictions_scaled:
+        # Используем target_scaler для денормализации
+        pred_original = dataset.target_scaler.inverse_transform(
+            np.array([[pred_scaled]])
+        )[0, 0]
+        predictions_original.append(float(pred_original))
+    
+    return predictions_original
 
-            # Пропускаем через модель
-            pred_flat = model(sequence_tensor).cpu().numpy()[0]
-            pred_scaled = pred_flat[0]  # Берем первый элемент прогноза (7 дней)
+# ========================
+# СОХРАНЕНИЕ / ЗАГРУЗКА
+# ========================
 
-            predictions.append(pred_scaled)
+def save_model_complete(model, dataset, config, save_path):
+    """Сохраняет модель и всю необходимую информацию."""
+    os.makedirs(save_path, exist_ok=True)
+    
+    # Модель
+    torch.save(model.state_dict(), os.path.join(save_path, 'model.pth'))
+    
+    # Scalers
+    with open(os.path.join(save_path, 'target_scaler.pkl'), 'wb') as f:
+        pickle.dump(dataset.target_scaler, f)
+    
+    if dataset.feature_scaler is not None:
+        with open(os.path.join(save_path, 'feature_scaler.pkl'), 'wb') as f:
+            pickle.dump(dataset.feature_scaler, f)
+    
+    # Конфигурация
+    with open(os.path.join(save_path, 'config.pkl'), 'wb') as f:
+        pickle.dump(config, f)
+    
+    # Список признаков
+    if dataset.feature_columns:
+        np.save(os.path.join(save_path, 'feature_columns.npy'), 
+                np.array(dataset.feature_columns, dtype=object))
 
-            # Обновляем последовательность: убираем первый элемент, добавляем новый
-            next_features = sequence[-1].copy()
-            next_features[-1] = pred_scaled  # Последний элемент - целевая переменная
-
-            sequence = np.vstack([sequence[1:], next_features])
-
-    # Денормализуем прогнозы
-    denorm_predictions = []
-    for pred_scaled in predictions:
-        dummy = np.zeros((1, len(dataset.features_columns) + 1))
-        dummy[0, -1] = pred_scaled
-        pred_original = scaler.inverse_transform(dummy)[0, -1]
-        denorm_predictions.append(max(0, pred_original))
-
-    return denorm_predictions
+def load_model_complete(model_class, save_path, device='cpu'):
+    """Загружает модель со всеми параметрами."""
+    # Конфигурация
+    with open(os.path.join(save_path, 'config.pkl'), 'rb') as f:
+        config = pickle.load(f)
+    
+    # Создаём и загружаем модель
+    model = model_class(**config['model_params'])
+    model.load_state_dict(torch.load(os.path.join(save_path, 'model.pth'), 
+                                     map_location=device))
+    model.to(device)
+    model.eval()
+    
+    # Scalers
+    with open(os.path.join(save_path, 'target_scaler.pkl'), 'rb') as f:
+        target_scaler = pickle.load(f)
+    
+    feature_scaler = None
+    feature_path = os.path.join(save_path, 'feature_scaler.pkl')
+    if os.path.exists(feature_path):
+        with open(feature_path, 'rb') as f:
+            feature_scaler = pickle.load(f)
+    
+    return model, target_scaler, feature_scaler, config

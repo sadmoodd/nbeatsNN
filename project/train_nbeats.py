@@ -1,265 +1,195 @@
+"""
+train_nbeats_fixed.py - Новый скрипт обучения с исправленной архитектурой
+"""
 import os
-import re
 import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, random_split, Dataset
-
-from utils import FishSalesDataset, safe_filename
-from utils import NBeatsModel, train_nbeats_model
-
-
-class FishSalesDatasetFlattened(Dataset):
-    """
-    Модификация FishSalesDataset для N-BEATS.
-
-    Вместо возврата (sequence_length, num_features) возвращает
-    (sequence_length * num_features,) - полностью флаттенированный вектор
-    """
-
-    def __init__(self, dataframe, sequence_length=30, target_column='Количество'):
-        # Используем оригинальный датасет
-        self.original_dataset = FishSalesDataset(
-            dataframe, 
-            sequence_length=sequence_length, 
-            target_column=target_column
-        )
-
-        self.sequence_length = sequence_length
-        self.num_features = len(self.original_dataset.features_columns)
-        self.flattened_size = self.sequence_length * self.num_features
-
-        # Копируем важные атрибуты
-        self.features_columns = self.original_dataset.features_columns
-        self.scaler = self.original_dataset.scaler
-        self.scaled_features = self.original_dataset.scaled_features
-        self.scaled_target = self.original_dataset.scaled_target
-
-    def __len__(self):
-        return len(self.original_dataset)
-
-    def __getitem__(self, idx):
-        # Получаем оригинальный батч
-        x_orig, y = self.original_dataset[idx]
-
-        # Флаттенируем входные данные
-        # x_orig имеет форму (sequence_length, num_features) = (30, 23)
-        x_flat = x_orig.flatten()  # Получаем форму (690,)
-
-        return x_flat, y
-
+from torch.utils.data import DataLoader, random_split
+from utils import (
+    TimeSeriesDataset, NBeatsModel, train_nbeats,
+    safe_filename, save_model_complete
+)
 
 def main():
-    """
-    Главная функция для обучения N-BEATS моделей с исправлениями.
-    """
-
     # ==========================================
     # КОНФИГУРАЦИЯ
     # ==========================================
-
-    data_path = 'data/DATA.csv'
-    models_dir = 'models_nbeats'
-    os.makedirs(models_dir, exist_ok=True)
-
-    # Гиперпараметры N-BEATS
-    SEQUENCE_LENGTH = 30           # Lookback window (сколько дней смотрим назад)
-    FORECAST_HORIZON = 7           # Forecast horizon (на сколько дней вперед)
-    NUM_STACKS = 3                 # Количество стеков
-    NUM_BLOCKS = 3                 # Количество блоков в каждом стеке
-    HIDDEN_LAYERS = [512, 512]     # Размеры скрытых слоев
-    DROPOUT = 0.1                  # Dropout вероятность
-
-    BATCH_SIZE = 32
-    EPOCHS = 100
+    
+    DATA_PATH = 'data/DATA.csv'
+    MODELS_DIR = 'models_nbeats_v2'
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    
+    # Гиперпараметры
+    SEQUENCE_LENGTH = 30        # Окно истории (дней)
+    FORECAST_HORIZON = 20       # Горизонт прогноза (дней)
+    NUM_STACKS = 4              # Стеков в модели
+    NUM_BLOCKS = 4              # Блоков на стек
+    HIDDEN_SIZES = [512, 512, 512]  # Размеры скрытых слоёв
+    DROPOUT = 0.15
+    
+    BATCH_SIZE = 16
+    EPOCHS = 200
     LEARNING_RATE = 0.001
-    EARLY_STOPPING_PATIENCE = 10
-
-    TRAIN_TEST_RATIO = 0.8
+    EARLY_STOPPING = 20
+    TRAIN_RATIO = 0.8
+    
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    print(f"Используется устройство: {DEVICE}")
-    print(f"\nПараметры модели:")
-    print(f"  - Sequence Length (lookback): {SEQUENCE_LENGTH}")
-    print(f"  - Forecast Horizon: {FORECAST_HORIZON}")
-    print(f"  - Количество стеков: {NUM_STACKS}")
-    print(f"  - Количество блоков в стеке: {NUM_BLOCKS}")
-    print(f"  - Скрытые слои: {HIDDEN_LAYERS}")
-    print()
-
+    
+    print("="*70)
+    print("N-BEATS v2: ИСПРАВЛЕННАЯ АРХИТЕКТУРА")
+    print("="*70)
+    print(f"\n📊 Параметры:")
+    print(f"  Sequence Length: {SEQUENCE_LENGTH} дней")
+    print(f"  Forecast Horizon: {FORECAST_HORIZON} дней")
+    print(f"  Stacks: {NUM_STACKS}, Blocks: {NUM_BLOCKS}")
+    print(f"  Hidden Sizes: {HIDDEN_SIZES}")
+    print(f"  Batch Size: {BATCH_SIZE}, Epochs: {EPOCHS}")
+    print(f"  Device: {DEVICE}\n")
+    
     # ==========================================
     # ЗАГРУЗКА ДАННЫХ
     # ==========================================
-
-    print("Загрузка данных...")
-    df = pd.read_csv(data_path)
+    
+    print("📂 Загрузка данных...")
+    df = pd.read_csv(DATA_PATH)
     df['date'] = pd.to_datetime(df['date']).dt.normalize()
     df = df.dropna().reset_index(drop=True)
-
-    nomenklatura_list = df['Номенклатура'].unique()
-    print(f"Найдено {len(nomenklatura_list)} номенклатур\n")
-
+    
+    nomenclatures = sorted(df['Номенклатура'].unique())
+    print(f"✅ Найдено {len(nomenclatures)} номенклатур\n")
+    
     # ==========================================
-    # ОБУЧЕНИЕ МОДЕЛЕЙ
+    # ОБУЧЕНИЕ
     # ==========================================
-
-    successful_models = 0
-    failed_models = 0
-
-    for idx, nomenklatura in enumerate(nomenklatura_list):
-        print(f"[{idx+1}/{len(nomenklatura_list)}] Обучаем модель для: {nomenklatura}")
-
-        # Фильтруем данные для текущей номенклатуры
-        df_sub = df[df['Номенклатура'] == nomenklatura].reset_index(drop=True)
-
-        # Проверяем минимальный размер данных
-        if len(df_sub) < 100:
-            print(f"  ⚠️  Слишком мало данных ({len(df_sub)} < 100), пропускаем\n")
-            failed_models += 1
+    
+    successful = 0
+    failed = 0
+    
+    for idx, nomen in enumerate(nomenclatures, 1):
+        print(f"[{idx}/{len(nomenclatures)}] {nomen}")
+        
+        df_sub = df[df['Номенклатура'] == nomen].reset_index(drop=True)
+        
+        # Минимальный размер
+        min_required = SEQUENCE_LENGTH + FORECAST_HORIZON + 50
+        if len(df_sub) < min_required:
+            print(f"  ⚠️  Недостаточно данных ({len(df_sub)} < {min_required})\n")
+            failed += 1
             continue
-
+        
         try:
-            # ==========================================
-            # ПОДГОТОВКА ДАТАСЕТА (ИСПРАВЛЕНО)
-            # ==========================================
-
-            # Используем FLATTENED датасет вместо оригинального
-            dataset = FishSalesDatasetFlattened(
-                df_sub, 
-                sequence_length=SEQUENCE_LENGTH, 
-                target_column='Количество'
+            # ===== ДАТАСЕТ =====
+            dataset = TimeSeriesDataset(
+                df_sub,
+                sequence_length=SEQUENCE_LENGTH,
+                target_column='Количество',
+                use_features=True
             )
-
-            # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: правильный input_size
-            input_size = SEQUENCE_LENGTH * dataset.num_features
-
-            print(f"  - Размер входа (flattened): {input_size} "
-                  f"({SEQUENCE_LENGTH} дней × {dataset.num_features} признаков)")
-
-            if len(dataset) < 10:
-                print(f"  ⚠️  Недостаточно примеров в датасете, пропускаем\n")
-                failed_models += 1
+            
+            if len(dataset) < 20:
+                print(f"  ⚠️  Слишком мало примеров после создания датасета\n")
+                failed += 1
                 continue
-
-            # Разделяем на обучающий и валидационный наборы
+            
+            # Флаттенированный размер входа
+            # КЛЮЧЕВОЙ МОМЕНТ: одно значение целевой переменной + признаки
+            input_dim = 1 + len(dataset.feature_columns)  # целевая + признаки
+            input_size = SEQUENCE_LENGTH * input_dim
+            
+            print(f"  📈 Input Size: {input_size} ({SEQUENCE_LENGTH} × {input_dim})")
+            print(f"  📊 Dataset Size: {len(dataset)} примеров")
+            
+            # ===== SPLIT =====
             size = len(dataset)
-            train_size = int(TRAIN_TEST_RATIO * size)
+            train_size = int(TRAIN_RATIO * size)
             val_size = size - train_size
-
+            
             train_set, val_set = random_split(
-                dataset, 
-                [train_size, val_size], 
+                dataset,
+                [train_size, val_size],
                 generator=torch.Generator().manual_seed(42)
             )
-
-            # Создаем DataLoaders
-            train_loader = DataLoader(
-                train_set, 
-                batch_size=BATCH_SIZE, 
-                shuffle=True
-            )
-            val_loader = DataLoader(
-                val_set, 
-                batch_size=BATCH_SIZE, 
-                shuffle=False
-            )
-
-            print(f"  - Размер обучающего набора: {train_size}")
-            print(f"  - Размер валидационного набора: {val_size}")
-
-            # ==========================================
-            # СОЗДАНИЕ И ОБУЧЕНИЕ МОДЕЛИ
-            # ==========================================
-
-            # Создаем N-BEATS модель с ПРАВИЛЬНЫМ input_size
+            
+            train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+            val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False)
+            
+            print(f"  🔄 Train: {train_size}, Val: {val_size}")
+            
+            # ===== МОДЕЛЬ =====
             model = NBeatsModel(
-                input_size=input_size,              # ← ИСПРАВЛЕНО!
+                input_size=input_size,
                 output_size=FORECAST_HORIZON,
                 num_stacks=NUM_STACKS,
-                num_blocks=NUM_BLOCKS,
-                hidden_layers=HIDDEN_LAYERS,
+                num_blocks_per_stack=NUM_BLOCKS,
+                hidden_sizes=HIDDEN_SIZES,
                 dropout=DROPOUT
             )
-
-            print(f"  - Количество параметров: "
-                  f"{sum(p.numel() for p in model.parameters()):,}")
-
-            # Обучаем модель
-            print("  - Обучение запущено...")
-            model, history = train_nbeats_model(
+            
+            num_params = sum(p.numel() for p in model.parameters())
+            print(f"  🧠 Parameters: {num_params:,}")
+            
+            # ===== ОБУЧЕНИЕ =====
+            print(f"  ⏳ Обучение...")
+            model, history = train_nbeats(
                 model=model,
                 train_loader=train_loader,
                 val_loader=val_loader,
                 epochs=EPOCHS,
                 lr=LEARNING_RATE,
                 device=DEVICE,
-                early_stopping_patience=EARLY_STOPPING_PATIENCE
+                early_stopping_patience=EARLY_STOPPING,
+                verbose=False
             )
-
-            # ==========================================
-            # СОХРАНЕНИЕ МОДЕЛИ
-            # ==========================================
-
-            safe_name = safe_filename(nomenklatura)
-
-            model_path = os.path.join(models_dir, f"{safe_name}_nbeats.pth")
-            scaler_path = os.path.join(models_dir, f"{safe_name}_nbeats_scaler.pkl")
-            features_path = os.path.join(models_dir, f"{safe_name}_nbeats_features.npy")
-            config_path = os.path.join(models_dir, f"{safe_name}_nbeats_config.txt")
-
-            # Сохраняем веса модели
-            torch.save(model.state_dict(), model_path)
-
-            # Сохраняем scaler
-            import pickle
-            with open(scaler_path, 'wb') as f:
-                pickle.dump(dataset.scaler, f)
-
-            # Сохраняем список признаков
-            np.save(features_path, np.array(dataset.features_columns, dtype=object))
-
-            # Сохраняем конфигурацию модели (ИСПРАВЛЕНО!)
+            
+            final_train_loss = history['train_loss'][-1]
+            final_val_loss = history['val_loss'][-1]
+            print(f"  ✅ Final Loss - Train: {final_train_loss:.6f}, Val: {final_val_loss:.6f}")
+            
+            # ===== СОХРАНЕНИЕ =====
+            safe_name = safe_filename(nomen)
+            save_dir = os.path.join(MODELS_DIR, safe_name)
+            
             config = {
-                'input_size': input_size,           # ← ИСПРАВЛЕНО!
-                'forecast_horizon': FORECAST_HORIZON,
-                'num_stacks': NUM_STACKS,
-                'num_blocks': NUM_BLOCKS,
-                'hidden_layers': HIDDEN_LAYERS,
-                'dropout': DROPOUT,
+                'model_params': {
+                    'input_size': input_size,
+                    'output_size': FORECAST_HORIZON,
+                    'num_stacks': NUM_STACKS,
+                    'num_blocks_per_stack': NUM_BLOCKS,
+                    'hidden_sizes': HIDDEN_SIZES,
+                    'dropout': DROPOUT
+                },
                 'sequence_length': SEQUENCE_LENGTH,
-                'num_features': dataset.num_features,  # ← НОВОЕ: для десериализации
-                'is_flattened': True                    # ← НОВОЕ: флаг
+                'forecast_horizon': FORECAST_HORIZON,
+                'feature_columns': dataset.feature_columns
             }
-
-            with open(config_path, 'w') as f:
-                for key, value in config.items():
-                    f.write(f"{key}: {value}\n")
-
-            print(f"  ✅ Модель сохранена: {model_path}")
-            print(f"  ✅ Scaler сохранен: {scaler_path}")
-            print(f"  ✅ Признаки сохранены: {features_path}")
-            print()
-
-            successful_models += 1
-
+            
+            save_model_complete(model, dataset, config, save_dir)
+            print(f"  💾 Модель сохранена: {save_dir}\n")
+            
+            successful += 1
+            
         except Exception as e:
-            print(f"  ❌ Ошибка при обучении: {str(e)}\n")
-            failed_models += 1
-            import traceback
-            traceback.print_exc()
+            print(f"  ❌ Ошибка: {str(e)}\n")
+            failed += 1
             continue
-
-    # ==========================================
-    # ИТОГИ
-    # ==========================================
-
-    print("="*60)
-    print(f"ОБУЧЕНИЕ ЗАВЕРШЕНО")
-    print(f"  ✅ Успешно обучено моделей: {successful_models}")
-    print(f"  ❌ Ошибок при обучении: {failed_models}")
-    print(f"  📁 Модели сохранены в: {models_dir}")
-    print("="*60)
-
+    
+    # ===== ИТОГИ =====
+    print("="*70)
+    print(f"✅ УСПЕШНО:    {successful}")
+    print(f"❌ ОШИБОК:     {failed}")
+    print(f"📁 ДИРЕКТОРИЯ: {MODELS_DIR}")
+    print("="*70)
 
 if __name__ == "__main__":
+    # ПРОВЕРКА GPU
+    print("🔍 Проверка GPU...")
+    print(f"CUDA доступна: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Память: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print(f"Выделено: {torch.cuda.memory_allocated(0) / 1e9:.1f} GB")
+    else:
+        print("⚠️  GPU недоступна, используется CPU")
+    print()
     main()
